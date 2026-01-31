@@ -21,9 +21,9 @@ import ac.grim.grimac.player.GrimPlayer;
 public class BukkitHologramBridge implements MLHologramBridge {
 
     private final Map<UUID, PlayerHologram> holograms = new ConcurrentHashMap<>();
-    private static final int MAX_STRIKES = 8;
+    private static final int MAX_STRIKES = 24; // Было 8 → 24 фичи
     private static final double HOLOGRAM_HEIGHT = 2.5;
-    private static final boolean DEBUG_MODE = true;
+    private static final boolean DEBUG_MODE = false; // Выключаем дебаг
     private static final boolean SHOW_EMPTY_HOLOGRAMS = true; // ВСЕГДА показывать голограммы
     private BukkitRunnable updateTask;
 
@@ -222,23 +222,24 @@ public class BukkitHologramBridge implements MLHologramBridge {
             headerStand.teleport(new Location(world, x, y + HOLOGRAM_HEIGHT + (index * 0.3), z));
             headerStand.setCustomName("§b§lПоследние проверки:");
 
-            // ИСПРАВЛЕНО: Если нет strikes, показываем "Нет данных"
-            if (strikes.isEmpty()) {
-                ArmorStand noDataStand = armorStands.get(index++);
-                noDataStand.teleport(new Location(world, x, y + HOLOGRAM_HEIGHT + (index * 0.3), z));
-                noDataStand.setCustomName("§7§oНет данных");
-            } else {
-                // Показываем strikes
-                for (double prob : strikes) {
-                    ArmorStand strikeStand = armorStands.get(index++);
-                    strikeStand.teleport(new Location(world, x, y + HOLOGRAM_HEIGHT + (index * 0.3), z));
+            // Показываем strikes (до MAX_STRIKES = 24)
+            for (int i = 0; i < Math.min(strikes.size(), 24); i++) {
+                double prob = strikes.get(i);
+                ArmorStand strikeStand = armorStands.get(index++);
+                strikeStand.teleport(new Location(world, x, y + HOLOGRAM_HEIGHT + (index * 0.3), z));
 
-                    String strikeText = formatStrikeLegacy(prob);
-                    strikeStand.setCustomName(strikeText);
-                }
+                String strikeText = formatStrikeLegacy(prob);
+                strikeStand.setCustomName(strikeText);
             }
 
-            // Последняя строка: AVG (всегда показываем, даже если 0.0000)
+            // Заполняем пустые слоты, если strikes < 24
+            for (int i = strikes.size(); i < 24 && index < armorStands.size() - 1; i++) {
+                ArmorStand emptyStand = armorStands.get(index++);
+                emptyStand.teleport(new Location(world, x, y + HOLOGRAM_HEIGHT + (index * 0.3), z));
+                emptyStand.setCustomName("§8§o...");
+            }
+
+            // Последняя строка: AVG (показываем N/A если 0.0)
             ArmorStand avgStand = armorStands.get(index);
             avgStand.teleport(new Location(world, x, y + HOLOGRAM_HEIGHT + (index * 0.3), z));
             avgStand.setCustomName(formatAverageLegacy());
@@ -263,6 +264,11 @@ public class BukkitHologramBridge implements MLHologramBridge {
         }
         // ЗАМЕНИ formatAverage() на:
         private String formatAverageLegacy() {
+            // Показываем N/A если среднее 0.0 (нет данных)
+            if (averageProbability < 0.0001) {
+                return "§7AVG: §7N/A";
+            }
+
             String color;
             if (averageProbability >= 0.7) {
                 color = "§4"; // DARK_RED

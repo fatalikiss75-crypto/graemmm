@@ -60,40 +60,18 @@ public class AimModel_SMART implements Serializable {
      */
     public double predict(double[] features) {
         if (features == null || features.length == 0) {
-            System.out.println("[MODEL DEBUG] predict() - NULL/EMPTY features!");
             return 0.0;
         }
 
         if (features.length != weights.length) {
-            System.err.println("╔════════════════════════════════════════════╗");
-            System.err.println("║  РАЗМЕРНОСТЬ НЕ СОВПАДАЕТ!                ║");
-            System.err.println("╠════════════════════════════════════════════╣");
-            System.err.println("║  Model weights: " + weights.length);
-            System.err.println("║  Input features: " + features.length);
-            System.err.println("║  ✗ Модель НЕ РАБОТАЕТ!                    ║");
-            System.err.println("║  ✓ Решение: /grimaitrain                  ║");
-            System.err.println("╚════════════════════════════════════════════╝");
-            return 0.0;
+            System.out.println("[MODEL WARN] Feature mismatch: expected=" + weights.length + ", got=" + features.length + ". Using /grimaitrain may fix this.");
+            double[] paddedFeatures = new double[weights.length];
+            System.arraycopy(features, 0, paddedFeatures, 0, Math.min(features.length, weights.length));
+            features = paddedFeatures;
         }
-        // =================================
-
-        // ДЕБАГ
-        System.out.println("[MODEL DEBUG] predict() called:");
-        System.out.println("  Input features length: " + features.length);
-        System.out.println("  Weights length: " + weights.length);
-        System.out.println("  Bias: " + bias);
-        System.out.println("  First 3 weights: " + Arrays.toString(Arrays.copyOf(weights, Math.min(3, weights.length))));
 
         double[] normalized = normalizeFeatures(features);
-
-        System.out.println("  Normalized length: " + normalized.length);
-        System.out.println("  First 3 normalized: " + Arrays.toString(Arrays.copyOf(normalized, Math.min(3, normalized.length))));
-
-        double result = predictRaw(normalized);
-
-        System.out.println("  RAW RESULT: " + String.format("%.6f", result));
-
-        return result;
+        return predictRaw(normalized);
     }
 
     /**
@@ -101,24 +79,14 @@ public class AimModel_SMART implements Serializable {
      */
     /**
      * Нормализация фичей (стандартизация)
-     * ИСПРАВЛЕНО: Проверка границ массива
      */
     private double[] normalizeFeatures(double[] features) {
-        // КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Проверяем ТОЧНОЕ совпадение!
-        if (features.length != featureMeans.length) {
-            System.err.println("╔════════════════════════════════════════════╗");
-            System.err.println("║  КРИТИЧЕСКАЯ ОШИБКА РАЗМЕРНОСТИ!          ║");
-            System.err.println("╠════════════════════════════════════════════╣");
-            System.err.println("║  Модель обучена на: " + featureMeans.length + " фичах");
-            System.err.println("║  Получено: " + features.length + " фичей");
-            System.err.println("║  ⚠ ПЕРЕОБУЧИТЕ: /grimaitrain              ║");
-            System.err.println("╚════════════════════════════════════════════╝");
-            return new double[featureMeans.length]; // Нули
+        if (features.length > featureMeans.length) {
+            features = Arrays.copyOf(features, featureMeans.length);
         }
 
-        double[] normalized = new double[features.length];
-
-        for (int i = 0; i < features.length; i++) {
+        double[] normalized = new double[featureMeans.length];
+        for (int i = 0; i < featureMeans.length && i < features.length; i++) {
             if (featureStds[i] > 1e-10) {
                 normalized[i] = (features[i] - featureMeans[i]) / featureStds[i];
             } else {
@@ -325,9 +293,26 @@ public class AimModel_SMART implements Serializable {
     }
 
     /**
-     * Сохранение модели
+     * Сохранение модели с валидацией размера
      */
     public void save(String path) throws IOException {
+        // Проверяем, что модель действительно обучена
+        if (weights.length < 24) {
+            throw new IOException("Model not properly trained! Weights length: " + weights.length + " (expected >= 24)");
+        }
+
+        // Проверяем, что веса не пустые
+        boolean allZeros = true;
+        for (double w : weights) {
+            if (w != 0.0) {
+                allZeros = false;
+                break;
+            }
+        }
+        if (allZeros) {
+            throw new IOException("Model has all zero weights - not properly trained!");
+        }
+
         File file = new File(path);
         file.getParentFile().mkdirs();
 
@@ -335,15 +320,34 @@ public class AimModel_SMART implements Serializable {
             oos.writeObject(this);
         }
 
-        System.out.println("[GrimAC ML] Модель сохранена: " + path);
+        long fileSize = file.length();
+        if (fileSize < 1000) { // Модель должна весить хотя бы 1KB
+            file.delete();
+            throw new IOException("Model file too small (" + fileSize + " bytes) - corrupted save!");
+        }
+
+        System.out.println("[GrimAC ML] Модель сохранена: " + path + " (" + fileSize + " bytes, " + weights.length + " features)");
     }
 
     /**
-     * Загрузка модели
+     * Загрузка модели с валидацией
      */
     public static AimModel_SMART load(String path) throws IOException, ClassNotFoundException {
-        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(path))) {
-            return (AimModel_SMART) ois.readObject();
+        File file = new File(path);
+        if (!file.exists() || file.length() < 1000) {
+            throw new IOException("Model file missing or too small: " + (file.exists() ? file.length() + " bytes" : "file not found"));
+        }
+
+        try (ObjectInputStream ois = new ObjectInputStream(new FileInputStream(file))) {
+            AimModel_SMART model = (AimModel_SMART) ois.readObject();
+
+            // Валидация загруженной модели
+            if (model.weights == null || model.weights.length < 24) {
+                throw new IOException("Loaded model is corrupted! Weights length: " + (model.weights != null ? model.weights.length : "null"));
+            }
+
+            System.out.println("[GrimAC ML] Модель загружена: " + path + " (" + file.length() + " bytes, " + model.weights.length + " features)");
+            return model;
         }
     }
 

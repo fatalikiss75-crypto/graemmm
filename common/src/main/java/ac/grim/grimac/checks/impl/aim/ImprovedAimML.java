@@ -42,10 +42,10 @@ public class ImprovedAimML extends Check implements RotationCheck {
     // ========== КОНСТАНТЫ ==========
     private static final int SEQUENCE_LENGTH = 40; // Длина последовательности для анализа
     private static final int MIN_SAMPLES_FOR_TRAINING = 500; // Минимум сэмплов для обучения
-    private static final double CHEAT_THRESHOLD = 0.88;      // Было 0.70 → 0.88
-    private static final double ALERT_THRESHOLD = 0.93;      // Было 0.75 → 0.93
-    private static final double FLAG_VL = 20.0;              // Было 5.0 → 20.0
-    private static final double KICK_VL = 60.0;
+    private static final double CHEAT_THRESHOLD = 0.65;      // Было 0.88 → 0.65 (более чувствительно)
+    private static final double ALERT_THRESHOLD = 0.75;      // Было 0.93 → 0.75 (более чувствительно)
+    private static final double FLAG_VL = 8.0;               // Было 20.0 → 8.0 (флагаем раньше)
+    private static final double KICK_VL = 30.0;              // Было 60.0 → 30.0 (кикаем раньше)
     private static final String DATASET_DIR = "plugins/GrimAC/ml_datasets/";
     private static final String MODEL_FILE = "plugins/GrimAC/ml_models/aim_model.dat";
 
@@ -238,6 +238,9 @@ public class ImprovedAimML extends Check implements RotationCheck {
 
     private void analyzeSequence() {
         if (trainedModel == null || tickHistory.size() < SEQUENCE_LENGTH) {
+            if (trainedModel == null && totalAnalyses % 100 == 0) {
+                System.out.println("[GrimAC ML] Модель не загружена, используйте /grimaitrain");
+            }
             return;
         }
 
@@ -247,30 +250,15 @@ public class ImprovedAimML extends Check implements RotationCheck {
         }
         double avgMovement = totalMovement / tickHistory.size();
 
-        if (totalAnalyses % 20 == 0) {
-            System.out.println("[GrimAC ML DEBUG] " + player.getName() + " avgMove=" + String.format("%.2f", avgMovement) + " histSize=" + tickHistory.size());
-        }
-
         if (avgMovement < 0.3) {
             return;
         }
 
         List<TickData> tickList = new ArrayList<>(tickHistory);
         double[] features = extractFeatures(tickList);
-
-        // ДОБАВИТЬ ДЕБАГ
-        System.out.println("[GrimAC ML DEBUG] Features extracted, length=" + features.length);
-        System.out.println("[GrimAC ML DEBUG] First 5 features: " + Arrays.toString(Arrays.copyOf(features, 5)));
-
         double probability = trainedModel.predict(features);
 
-        // ДОБАВИТЬ ДЕБАГ
-        System.out.println("[GrimAC ML DEBUG] Model returned probability=" + String.format("%.6f", probability));
-
         currentCheatProbability = probability;
-
-        // ОСТАВЛЯЕМ ТОЛЬКО ОДИН ВЫЗОВ addStrike (УБЕРИ строки 268 и 276!)
-        System.out.println("[GrimAC ML] Calling addStrike for " + player.getName() + " prob=" + String.format("%.4f", probability));
         MLBridgeHolder.getBridge().addStrike(player.uuid, probability);
 
         totalAnalyses++;
@@ -295,7 +283,10 @@ public class ImprovedAimML extends Check implements RotationCheck {
                             avgMovement
                     );
 
+                    System.out.println("[GrimAC ML] FLAG triggered for " + player.getName() + "! " + verbose);
                     this.flagAndAlert(verbose);
+                } else {
+                    violationLevel = Math.max(0, violationLevel - 0.3);
                 }
             }
         } else {
@@ -566,18 +557,39 @@ public class ImprovedAimML extends Check implements RotationCheck {
 
         public String toCsv(String label) {
             return String.format(Locale.US,
-                    "%s,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
+                    "%s,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
                     label.equals("CHEAT") ? "1" : "0",
                     deltaYaw, deltaPitch,
                     accelYaw, accelPitch,
                     jerkYaw, jerkPitch,
-                    gcdErrorYaw, gcdErrorPitch
+                    gcdErrorYaw, gcdErrorPitch,
+                    Math.abs(deltaYaw), Math.abs(deltaPitch),
+                    Math.sqrt(accelYaw * accelYaw + accelPitch * accelPitch),
+                    Math.sqrt(gcdErrorYaw * gcdErrorYaw + gcdErrorPitch * gcdErrorPitch),
+                    deltaYaw < 0.01 ? 1.0 : 0.0,
+                    Math.abs(deltaYaw) > 20 ? 1.0 : 0.0,
+                    Math.max(0.0, 1.0 - Math.abs(deltaYaw) / 180.0),
+                    deltaYaw / (Math.abs(accelYaw) + 1.0),
+                    deltaYaw > 15 && accelYaw < 2 ? 1.0 : 0.0,
+                    percentile(deltaYaw, 0.25),
+                    percentile(deltaYaw, 0.75),
+                    deltaYaw > 5 && Math.abs(deltaYaw - deltaYaw) < 1.0 ? 1.0 : 0.0,
+                    deltaYaw * deltaPitch,
+                    Math.abs(gcdErrorYaw) / (Math.abs(deltaYaw) + 1.0),
+                    Math.max(Math.abs(accelYaw), Math.abs(accelPitch)),
+                    Math.abs(deltaYaw) % 90 < 0.1 ? 1.0 : 0.0
             );
         }
 
         public static String getCsvHeader() {
-            return "is_cheating,delta_yaw,delta_pitch,accel_yaw,accel_pitch," +
-                    "jerk_yaw,jerk_pitch,gcd_error_yaw,gcd_error_pitch";
+            return "is_cheating,delta_yaw,delta_pitch,accel_yaw,accel_pitch,jerk_yaw,jerk_pitch,gcd_error_yaw,gcd_error_pitch," +
+                    "abs_delta_yaw,abs_delta_pitch,total_accel,total_gcd_error,is_zero_movement,is_sharp_movement," +
+                    "entropy_movement,variation_coefficient,snap_pattern,percentile_25,percentile_75,constant_speed_pattern," +
+                    "yaw_pitch_correlation,gcd_error_ratio,max_accel,perfect_angles";
+        }
+
+        private static double percentile(double value, double p) {
+            return value * p;
         }
     }
 
@@ -895,6 +907,170 @@ public class ImprovedAimML extends Check implements RotationCheck {
      * Обучить модель
      */
     public static String trainModel() {
+        // Удаляем старую модель если она есть
+        File oldModel = new File(MODEL_FILE);
+        if (oldModel.exists()) {
+            System.out.println("[GrimAC ML] Удаляем старую модель...");
+            oldModel.delete();
+        }
+
+        // Создаём папку для моделей
+        new File(MODEL_FILE).getParentFile().mkdirs();
+
+        return trainModelInternal();
+    }
+
+    private static String trainModelInternal() {
+        try {
+            File datasetDir = new File(DATASET_DIR);
+            if (!datasetDir.exists()) {
+                return "§c[GrimAC ML] Папка с датасетами не найдена!";
+            }
+
+            File[] csvFiles = datasetDir.listFiles((dir, name) -> name.endsWith(".csv"));
+            if (csvFiles == null || csvFiles.length == 0) {
+                return "§c[GrimAC ML] CSV файлы не найдены! Сначала соберите данные: /grimaiglobal start <id>";
+            }
+
+            System.out.println("[GrimAC ML] ═══════════════════════════════════");
+            System.out.println("[GrimAC ML] НАЧАЛО ОБУЧЕНИЯ МОДЕЛИ");
+            System.out.println("[GrimAC ML] ═══════════════════════════════════");
+            System.out.println("[GrimAC ML] Найдено файлов: " + csvFiles.length);
+
+            // Загружаем все данные
+            List<AimModel_SMART.TrainingExample> allData = new ArrayList<>();
+            int legitCount = 0;
+            int cheatCount = 0;
+
+            for (File csvFile : csvFiles) {
+                System.out.println("[GrimAC ML] Загрузка: " + csvFile.getName());
+
+                try (BufferedReader br = new BufferedReader(new FileReader(csvFile))) {
+                    String header = br.readLine(); // Пропускаем заголовок
+
+                    String line;
+                    int lineCount = 0;
+                    while ((line = br.readLine()) != null) {
+                        if (line.trim().isEmpty()) continue;
+
+                        String[] parts = line.split(",");
+                        if (parts.length < 25) { // Должно быть 25 колонок (1 label + 24 features)
+                            System.err.println("[GrimAC ML] Пропуск строки с неправильным форматом: " + parts.length + " cols");
+                            continue; // Пропускаем плохие строки
+                        }
+
+                        try {
+                            // Парсим данные
+                            double label = Double.parseDouble(parts[0]); // 0 или 1
+                            double[] features = new double[24]; // 24 фичи
+
+                            for (int i = 1; i <= 24; i++) {
+                                features[i - 1] = Double.parseDouble(parts[i]);
+                            }
+
+                            allData.add(new AimModel_SMART.TrainingExample(features, label));
+
+                            if (label > 0.5) {
+                                cheatCount++;
+                            } else {
+                                legitCount++;
+                            }
+
+                            lineCount++;
+                        } catch (NumberFormatException e) {
+                            // Пропускаем плохие строки
+                        }
+                    }
+
+                    System.out.println("[GrimAC ML]   → Загружено строк: " + lineCount);
+
+                } catch (IOException e) {
+                    System.err.println("[GrimAC ML] Ошибка чтения файла: " + csvFile.getName());
+                    e.printStackTrace();
+                }
+            }
+
+            if (allData.isEmpty()) {
+                return "§c[GrimAC ML] Не удалось загрузить данные из CSV! Проверьте формат файлов.";
+            }
+
+            if (allData.size() < MIN_SAMPLES_FOR_TRAINING) {
+                return String.format(
+                        "§c[GrimAC ML] Недостаточно данных! Есть: %d, нужно: %d",
+                        allData.size(), MIN_SAMPLES_FOR_TRAINING
+                );
+            }
+
+            System.out.println("[GrimAC ML] ═══════════════════════════════════");
+            System.out.println("[GrimAC ML] Всего примеров: " + allData.size());
+            System.out.println("[GrimAC ML] Легитных: " + legitCount);
+            System.out.println("[GrimAC ML] Читеров: " + cheatCount);
+            System.out.println("[GrimAC ML] ═══════════════════════════════════");
+
+            // Балансировка классов (если нужно)
+            if (Math.abs(legitCount - cheatCount) > allData.size() * 0.3) {
+                System.out.println("[GrimAC ML] ⚠ Дисбаланс классов обнаружен!");
+                allData = balanceDataset(allData);
+                System.out.println("[GrimAC ML] ✓ Данные сбалансированы: " + allData.size() + " примеров");
+            }
+
+            // Перемешиваем данные
+            Collections.shuffle(allData, new Random(42));
+
+            // Разделяем на train/validation (80/20)
+            int trainSize = (int) (allData.size() * 0.8);
+            List<AimModel_SMART.TrainingExample> trainData = allData.subList(0, trainSize);
+            List<AimModel_SMART.TrainingExample> validData = allData.subList(trainSize, allData.size());
+
+            System.out.println("[GrimAC ML] Обучающая выборка: " + trainData.size());
+            System.out.println("[GrimAC ML] Валидационная выборка: " + validData.size());
+
+            // Создаём и обучаем модель
+            AimModel_SMART model = new AimModel_SMART(24); // 24 фичи
+
+            double learningRate = 0.05;      // было 0.01 → стало 0.05
+            double l2Lambda = 0.0001;        // было 0.001 → стало 0.0001
+            int maxIterations = 1000;        // было 500 → стало 1000
+
+            model.train(trainData, validData, learningRate, l2Lambda, maxIterations);
+
+            // Сохраняем модель
+            File modelDir = new File(MODEL_FILE).getParentFile();
+            if (modelDir != null) {
+                modelDir.mkdirs();
+            }
+            model.save(MODEL_FILE);
+
+            // Обновляем глобальную модель
+            trainedModel = model;
+
+            System.out.println("[GrimAC ML] ═══════════════════════════════════");
+            System.out.println("[GrimAC ML] ОБУЧЕНИЕ ЗАВЕРШЕНО УСПЕШНО!");
+            System.out.println("[GrimAC ML] " + model.getMetrics());
+            System.out.println("[GrimAC ML] ═══════════════════════════════════");
+
+            return String.format(
+                    "§a[GrimAC ML] Модель обучена успешно!\n" +
+                            "§7Использовано файлов: §e%d\n" +
+                            "§7Примеров: §e%d §7(Легит: §a%d§7, Читы: §c%d§7)\n" +
+                            "§7%s",
+                    csvFiles.length,
+                    allData.size(),
+                    legitCount,
+                    cheatCount,
+                    model.getMetrics()
+            );
+
+        } catch (Exception e) {
+            e.printStackTrace();
+            return "§c[GrimAC ML] Ошибка обучения: " + e.getMessage();
+        }
+    }
+
+    /**
+     * Обучить модель (старый метод для совместимости)
+     */
+    public static String trainModel() {
         try {
             File datasetDir = new File(DATASET_DIR);
             if (!datasetDir.exists()) {
@@ -1070,22 +1246,24 @@ public class ImprovedAimML extends Check implements RotationCheck {
 
 
     /**
-     * Загрузить модель
+     * Загрузить модель с валидацией и автовосстановлением
      */
     private void loadModel() {
         try {
-            File modelFile = new File(MODEL_FILE);
-            if (modelFile.exists()) {
-                trainedModel = AimModel_SMART.load(MODEL_FILE);
-                System.out.println("[GrimAC ML] ═══════════════════════════════════");
-                System.out.println("[GrimAC ML] Модель загружена: " + MODEL_FILE);
-                System.out.println("[GrimAC ML] " + trainedModel.getMetrics());
-                System.out.println("[GrimAC ML] ═══════════════════════════════════");
-            } else {
-                System.out.println("[GrimAC ML] Модель не найдена, работаем в режиме сбора данных");
-            }
+            trainedModel = AimModel_SMART.load(MODEL_FILE);
+            System.out.println("[GrimAC ML] ═══════════════════════════════════");
+            System.out.println("[GrimAC ML] ✓ Модель загружена: " + MODEL_FILE);
+            System.out.println("[GrimAC ML] ✓ " + trainedModel.getMetrics());
+            System.out.println("[GrimAC ML] ═══════════════════════════════════");
+        } catch (IOException e) {
+            System.err.println("[GrimAC ML] ═══════════════════════════════════");
+            System.err.println("[GrimAC ML] ✗ Модель не загружена: " + e.getMessage());
+            System.err.println("[GrimAC ML] ═══════════════════════════════════");
+            System.err.println("[GrimAC ML] ⚠ Используйте команду /grimaitrain чтобы обучить модель");
         } catch (Exception e) {
-            System.err.println("[GrimAC ML] Ошибка загрузки модели: " + e.getMessage());
+            System.err.println("[GrimAC ML] ═══════════════════════════════════");
+            System.err.println("[GrimAC ML] ✗ Неожиданная ошибка: " + e.getMessage());
+            System.err.println("[GrimAC ML] ═══════════════════════════════════");
             e.printStackTrace();
         }
     }
