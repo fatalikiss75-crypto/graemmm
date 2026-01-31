@@ -139,8 +139,14 @@ public class MLMenuGUI {
 
         lore.add("");
 
-        String avgColor = getLegacyProbabilityColor(data.avgProbability);
-        lore.add("§7Средний риск: §8AVG " + avgColor + "§l" + String.format("%.4f", data.avgProbability));
+        String avgDisplay;
+        if (data.avgProbability < 0) {
+            avgDisplay = "§7N/A"; // Показываем N/A вместо 0.0000
+        } else {
+            String avgColor = getLegacyProbabilityColor(data.avgProbability);
+            avgDisplay = avgColor + "§l" + String.format("%.4f", data.avgProbability);
+        }
+        lore.add("§7Средний риск: §8AVG " + avgDisplay);
 
         lore.add("");
         lore.add("§7Последний сервер: §b" + (data.lastServer != null ? data.lastServer : "N/A"));
@@ -265,7 +271,7 @@ public class MLMenuGUI {
         for (GrimPlayer grimPlayer : GrimAPI.INSTANCE.getPlayerDataManager().getEntries()) {
             BukkitHologramBridge.PlayerHologram hologram = bukkitBridge.getHologram(grimPlayer.uuid);
 
-            // ИСПРАВЛЕНО: Показываем ВСЕХ игроков, даже без данных
+            // ИСПРАВЛЕНО: Показываем ВСЕХ игроков, даже без данных, с 24 фичами
             PlayerData data = new PlayerData();
             data.playerUUID = grimPlayer.uuid;
             data.playerName = grimPlayer.getName();
@@ -275,9 +281,10 @@ public class MLMenuGUI {
                 data.avgProbability = hologram.getAverageProbability();
                 data.lastStrikeTime = hologram.getLastUpdate();
             } else {
-                // Нет данных ML - показываем пустые значения
+                // Нет данных ML - НЕ показываем 0.0000, показываем N/A
                 data.strikes = new ArrayList<>();
-                data.avgProbability = 0.0;
+                // Для пустых данных показываем "N/A" вместо 0.0000
+                data.avgProbability = -1.0; // Специальное значение для N/A
                 data.lastStrikeTime = 0;
             }
 
