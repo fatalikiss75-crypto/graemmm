@@ -69,6 +69,8 @@ public class ImprovedAimML extends Check implements RotationCheck {
     // Для вычисления производных
     private float lastDeltaYaw = 0.0f;
     private float lastDeltaPitch = 0.0f;
+    private float lastAccelYaw = 0.0f;
+    private float lastAccelPitch = 0.0f;
     private double estimatedGcdYaw = 0.0;
     private double estimatedGcdPitch = 0.0;
 
@@ -144,6 +146,7 @@ public class ImprovedAimML extends Check implements RotationCheck {
 
     /**
      * Создание расширенного тика с дополнительными фичами
+     * ИСПРАВЛЕНО: Добавлен расчёт jerk (рывок)
      */
     private TickData createTickData(RotationUpdate update) {
         float deltaYaw = update.getTo().yaw() - update.getFrom().yaw();
@@ -157,7 +160,8 @@ public class ImprovedAimML extends Check implements RotationCheck {
         float accelPitch = deltaPitch - lastDeltaPitch;
 
         // Вычисляем рывок (jerk) = изменение ускорения
-        // (это будет вычисляться в следующем тике)
+        float jerkYaw = lastAccelYaw > 0 ? accelYaw - lastAccelYaw : 0.0f;
+        float jerkPitch = lastAccelPitch > 0 ? accelPitch - lastAccelPitch : 0.0f;
 
         // Оцениваем GCD (наибольший общий делитель)
         updateGcdEstimate(Math.abs(deltaYaw), Math.abs(deltaPitch));
@@ -171,8 +175,8 @@ public class ImprovedAimML extends Check implements RotationCheck {
                 deltaPitch,
                 accelYaw,
                 accelPitch,
-                0.0f, // jerkYaw - будет обновлён позже
-                0.0f, // jerkPitch - будет обновлён позже
+                jerkYaw,
+                jerkPitch,
                 gcdErrorYaw,
                 gcdErrorPitch,
                 System.currentTimeMillis(),
@@ -184,6 +188,8 @@ public class ImprovedAimML extends Check implements RotationCheck {
         // Обновляем для следующей итерации
         lastDeltaYaw = deltaYaw;
         lastDeltaPitch = deltaPitch;
+        lastAccelYaw = accelYaw;
+        lastAccelPitch = accelPitch;
 
         return tick;
     }
@@ -233,9 +239,8 @@ public class ImprovedAimML extends Check implements RotationCheck {
 
     /**
      * Анализ последовательности тиков через ML-модель
+     * ИСПРАВЛЕНО: Исправлен расчёт фичей (8 вместо 24)
      */
-    // В методе analyzeSequence() УДАЛИ строки 268 и 276, оставь ОДНУ в конце:
-
     private void analyzeSequence() {
         if (trainedModel == null || tickHistory.size() < SEQUENCE_LENGTH) {
             return;
@@ -258,19 +263,10 @@ public class ImprovedAimML extends Check implements RotationCheck {
         List<TickData> tickList = new ArrayList<>(tickHistory);
         double[] features = extractFeatures(tickList);
 
-        // ДОБАВИТЬ ДЕБАГ
-        System.out.println("[GrimAC ML DEBUG] Features extracted, length=" + features.length);
-        System.out.println("[GrimAC ML DEBUG] First 5 features: " + Arrays.toString(Arrays.copyOf(features, 5)));
-
         double probability = trainedModel.predict(features);
-
-        // ДОБАВИТЬ ДЕБАГ
-        System.out.println("[GrimAC ML DEBUG] Model returned probability=" + String.format("%.6f", probability));
-
         currentCheatProbability = probability;
 
-        // ОСТАВЛЯЕМ ТОЛЬКО ОДИН ВЫЗОВ addStrike (УБЕРИ строки 268 и 276!)
-        System.out.println("[GrimAC ML] Calling addStrike for " + player.getName() + " prob=" + String.format("%.4f", probability));
+        // Добавляем в голограмму/GUI
         MLBridgeHolder.getBridge().addStrike(player.uuid, probability);
 
         totalAnalyses++;
@@ -332,93 +328,26 @@ public class ImprovedAimML extends Check implements RotationCheck {
      * Извлечение признаков из последовательности тиков
      */
     /**
-     * Извлечение признаков из последовательности тиков (24 фичи)
+     * Извлечение признаков из последовательности тиков (8 фичей - per-tick)
+     * ИСПРАВЛЕНО: Извлекаем только 8 фичей для совместимости с обученной моделью
      */
     private double[] extractFeatures(List<TickData> ticks) {
-        double[] features = new double[24]; // 24 фичи
+        double[] features = new double[8]; // 8 фичей - как в обучающей выборке
 
         if (ticks.isEmpty()) return features;
 
-        List<Double> deltaYaws = new ArrayList<>();
-        List<Double> deltaPitches = new ArrayList<>();
-        List<Double> accelYaws = new ArrayList<>();
-        List<Double> accelPitches = new ArrayList<>();
-        List<Double> gcdErrorsYaw = new ArrayList<>();
-        List<Double> gcdErrorsPitch = new ArrayList<>();
+        // Берём последний тик как representative sample (как в обучении)
+        TickData lastTick = ticks.get(ticks.size() - 1);
 
-        for (TickData tick : ticks) {
-            deltaYaws.add((double) Math.abs(tick.deltaYaw));
-            deltaPitches.add((double) Math.abs(tick.deltaPitch));
-            accelYaws.add((double) Math.abs(tick.accelYaw));
-            accelPitches.add((double) Math.abs(tick.accelPitch));
-            gcdErrorsYaw.add((double) tick.gcdErrorYaw);
-            gcdErrorsPitch.add((double) tick.gcdErrorPitch);
-        }
-
-        // Feature 0-1: Средняя скорость
-        features[0] = average(deltaYaws);
-        features[1] = average(deltaPitches);
-
-        // Feature 2-3: Стандартное отклонение скорости
-        features[2] = standardDeviation(deltaYaws);
-        features[3] = standardDeviation(deltaPitches);
-
-        // Feature 4-5: Максимальная скорость
-        features[4] = deltaYaws.isEmpty() ? 0 : Collections.max(deltaYaws);
-        features[5] = deltaPitches.isEmpty() ? 0 : Collections.max(deltaPitches);
-
-        // Feature 6-7: Среднее ускорение
-        features[6] = average(accelYaws);
-        features[7] = average(accelPitches);
-
-        // Feature 8-9: Стандартное отклонение ускорения
-        features[8] = standardDeviation(accelYaws);
-        features[9] = standardDeviation(accelPitches);
-
-        // Feature 10-11: Средняя GCD-ошибка
-        features[10] = average(gcdErrorsYaw);
-        features[11] = average(gcdErrorsPitch);
-
-        // Feature 12: Процент нулевых движений
-        features[12] = deltaYaws.stream().filter(d -> d < 0.01).count() / (double) deltaYaws.size();
-
-        // Feature 13: Процент резких движений (>20 градусов)
-        features[13] = deltaYaws.stream().filter(d -> d > 20).count() / (double) deltaYaws.size();
-
-        // Feature 14: Энтропия движений
-        features[14] = calculateEntropy(deltaYaws);
-
-        // Feature 15: Коэффициент вариации
-        features[15] = features[2] / (features[0] + 0.001);
-
-        // Feature 16: Паттерн "снапа"
-        features[16] = detectSnapPattern(deltaYaws);
-
-        // Feature 17-18: Квантили (25% и 75%)
-        features[17] = percentile(deltaYaws, 0.25);
-        features[18] = percentile(deltaYaws, 0.75);
-
-        // Feature 19: Константная скорость
-        features[19] = detectConstantSpeedPattern(deltaYaws);
-
-        // Feature 20: Корреляция yaw/pitch
-        features[20] = calculateCorrelation(deltaYaws, deltaPitches);
-
-        // Feature 21: Среднее соотношение GCD-ошибки к движению
-        features[21] = features[10] / (features[0] + 0.001);
-
-        // Feature 22: Максимальное ускорение
-        features[22] = accelYaws.isEmpty() ? 0 : Collections.max(accelYaws);
-
-        // Feature 23: Процент идеально прямых углов
-        features[23] = countPerfectAngles(ticks) / (double) ticks.size();
-
-
-
-        System.out.println("[FEATURES DEBUG] Extracted features:");
-        for (int i = 0; i < features.length; i++) {
-            System.out.println("  feature[" + i + "] = " + String.format("%.6f", features[i]));
-        }
+        // Feature 0-7: Per-tick features (как в CSV)
+        features[0] = Math.abs(lastTick.deltaYaw);
+        features[1] = Math.abs(lastTick.deltaPitch);
+        features[2] = Math.abs(lastTick.accelYaw);
+        features[3] = Math.abs(lastTick.accelPitch);
+        features[4] = Math.abs(lastTick.jerkYaw);
+        features[5] = Math.abs(lastTick.jerkPitch);
+        features[6] = lastTick.gcdErrorYaw;
+        features[7] = lastTick.gcdErrorPitch;
 
         // Проверка на NaN/Infinity
         for (int i = 0; i < features.length; i++) {

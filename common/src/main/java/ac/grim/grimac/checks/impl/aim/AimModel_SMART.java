@@ -75,23 +75,9 @@ public class AimModel_SMART implements Serializable {
             System.err.println("╚════════════════════════════════════════════╝");
             return 0.0;
         }
-        // =================================
-
-        // ДЕБАГ
-        System.out.println("[MODEL DEBUG] predict() called:");
-        System.out.println("  Input features length: " + features.length);
-        System.out.println("  Weights length: " + weights.length);
-        System.out.println("  Bias: " + bias);
-        System.out.println("  First 3 weights: " + Arrays.toString(Arrays.copyOf(weights, Math.min(3, weights.length))));
 
         double[] normalized = normalizeFeatures(features);
-
-        System.out.println("  Normalized length: " + normalized.length);
-        System.out.println("  First 3 normalized: " + Arrays.toString(Arrays.copyOf(normalized, Math.min(3, normalized.length))));
-
         double result = predictRaw(normalized);
-
-        System.out.println("  RAW RESULT: " + String.format("%.6f", result));
 
         return result;
     }
