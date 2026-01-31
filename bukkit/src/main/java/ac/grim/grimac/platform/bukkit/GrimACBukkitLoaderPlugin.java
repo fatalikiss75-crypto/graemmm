@@ -52,6 +52,9 @@ import org.incendo.cloud.bukkit.CloudBukkitCapabilities;
 import org.incendo.cloud.execution.ExecutionCoordinator;
 import org.incendo.cloud.paper.LegacyPaperCommandManager;
 
+// ========== ML SYSTEM IMPORTS ==========
+import ac.grim.grimac.platform.bukkit.player.MLMenuListener;
+// ========================================
 
 public final class GrimACBukkitLoaderPlugin extends JavaPlugin implements PlatformLoader {
 
@@ -100,10 +103,27 @@ public final class GrimACBukkitLoaderPlugin extends JavaPlugin implements Platfo
     @Override
     public void onEnable() {
         GrimAPI.INSTANCE.start();
+
+        try {
+            MLBridgeInitializer.initialize(this);
+            getServer().getPluginManager().registerEvents(new MLMenuListener(), this);
+
+            getLogger().info("[GrimAC ML] System initialized!");
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
     }
 
     @Override
     public void onDisable() {
+        // ========== ML SYSTEM ==========
+        try {
+            MLBridgeInitializer.shutdown();
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        // ================================
+
         GrimAPI.INSTANCE.stop();
     }
 
@@ -231,6 +251,8 @@ public final class GrimACBukkitLoaderPlugin extends JavaPlugin implements Platfo
                 ExecutionCoordinator.simpleCoordinator(),
                 senderFactory.get()
         );
+        MLCommandRegistrar.register(manager);
+
         if (manager.hasCapability(CloudBukkitCapabilities.NATIVE_BRIGADIER)) {
             try {
                 manager.registerBrigadier();

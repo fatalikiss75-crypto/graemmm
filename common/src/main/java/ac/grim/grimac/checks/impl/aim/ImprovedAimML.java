@@ -1,12 +1,12 @@
 package ac.grim.grimac.checks.impl.aim;
 
+import ac.grim.grimac.GrimAPI;
 import ac.grim.grimac.checks.Check;
 import ac.grim.grimac.checks.CheckData;
 import ac.grim.grimac.checks.type.RotationCheck;
 import ac.grim.grimac.player.GrimPlayer;
 import ac.grim.grimac.utils.anticheat.update.RotationUpdate;
 import lombok.Getter;
-import net.kyori.adventure.text.Component;
 
 import java.io.*;
 import java.nio.file.Files;
@@ -42,10 +42,10 @@ public class ImprovedAimML extends Check implements RotationCheck {
     // ========== КОНСТАНТЫ ==========
     private static final int SEQUENCE_LENGTH = 40; // Длина последовательности для анализа
     private static final int MIN_SAMPLES_FOR_TRAINING = 500; // Минимум сэмплов для обучения
-    private static final double CHEAT_THRESHOLD = 0.70; // Порог вероятности чита
-    private static final double ALERT_THRESHOLD = 0.75; // Порог для алертов
-    private static final double FLAG_VL = 5.0; // VL для флага
-    private static final double KICK_VL = 20.0; // VL для кика
+    private static final double CHEAT_THRESHOLD = 0.88;      // Было 0.70 → 0.88
+    private static final double ALERT_THRESHOLD = 0.93;      // Было 0.75 → 0.93
+    private static final double FLAG_VL = 20.0;              // Было 5.0 → 20.0
+    private static final double KICK_VL = 60.0;
     private static final String DATASET_DIR = "plugins/GrimAC/ml_datasets/";
     private static final String MODEL_FILE = "plugins/GrimAC/ml_models/aim_model.dat";
 
@@ -54,7 +54,7 @@ public class ImprovedAimML extends Check implements RotationCheck {
     private static final Map<UUID, DataCollector> activeCollectors = new ConcurrentHashMap<>();
     @Getter
     private static String globalCollectionId = null; // ID глобального сбора
-    private static AimModel trainedModel = null;
+    private static AimModel_SMART trainedModel = null;
 
     // ========== ДАННЫЕ ИГРОКА ==========
     private final Deque<TickData> tickHistory = new ArrayDeque<>(SEQUENCE_LENGTH);
@@ -62,6 +62,9 @@ public class ImprovedAimML extends Check implements RotationCheck {
     private double violationLevel = 0.0;
     private long lastVLUpdate = System.currentTimeMillis();
     private int ticksSinceLastAnalysis = 0;
+    private long lastVLDecay = System.currentTimeMillis();
+    private int totalAnalyses = 0;
+    private int highProbabilityDetections = 0;
 
     // Для вычисления производных
     private float lastDeltaYaw = 0.0f;
@@ -91,6 +94,19 @@ public class ImprovedAimML extends Check implements RotationCheck {
         // Создаём тик с расширенными данными
         TickData tick = createTickData(rotationUpdate);
 
+        // НОВОЕ: Фильтруем шум - игнорируем очень малые движения
+        double totalMovement = Math.sqrt(
+                tick.deltaYaw * tick.deltaYaw +
+                        tick.deltaPitch * tick.deltaPitch
+        );
+
+        GrimPlayer grimPlayer = rotationUpdate.getProcessor().getPlayer();
+        System.out.println("[GrimAC ML DEBUG] process() вызван для " + grimPlayer.getName());
+
+
+        // Игнорируем движения меньше 1 градуса (было раньше сразу добавление)
+        // ИСПРАВЛЕНО: Убран фильтр малых движений - принимаем все данные
+
         // Добавляем в историю
         tickHistory.add(tick);
         if (tickHistory.size() > SEQUENCE_LENGTH) {
@@ -103,11 +119,26 @@ public class ImprovedAimML extends Check implements RotationCheck {
             collector.addTick(tick);
         }
 
-        // Анализируем каждые 10 тиков
+        // НОВОЕ: Decay VL со временем
+        decayViolationLevel();
+
+        // ИСПРАВЛЕНО: Анализируем реже - каждые 25 тиков (было 10)
         ticksSinceLastAnalysis++;
-        if (ticksSinceLastAnalysis >= 10 && tickHistory.size() >= SEQUENCE_LENGTH) {
+        if (ticksSinceLastAnalysis >= 5 && tickHistory.size() >= SEQUENCE_LENGTH) {  // ИСПРАВЛЕНО: было 10
             analyzeSequence();
             ticksSinceLastAnalysis = 0;
+        }
+    }
+    /**
+     * НОВОЕ: Уменьшение VL со временем при отсутствии читов
+     */
+    private void decayViolationLevel() {
+        long now = System.currentTimeMillis();
+        long timeSinceDecay = now - lastVLDecay;
+
+        if (timeSinceDecay >= 5000 && violationLevel > 0) { // Каждые 5 секунд
+            violationLevel = Math.max(0, violationLevel - 0.5); // Уменьшаем на 0.5
+            lastVLDecay = now;
         }
     }
 
@@ -136,18 +167,18 @@ public class ImprovedAimML extends Check implements RotationCheck {
         float gcdErrorPitch = (float) calculateGcdError(Math.abs(deltaPitch), estimatedGcdPitch);
 
         TickData tick = new TickData(
-            deltaYaw,
-            deltaPitch,
-            accelYaw,
-            accelPitch,
-            0.0f, // jerkYaw - будет обновлён позже
-            0.0f, // jerkPitch - будет обновлён позже
-            gcdErrorYaw,
-            gcdErrorPitch,
-            System.currentTimeMillis(),
-            player.getTransactionPing(),
-            player.isSprinting,
-            player.isSneaking
+                deltaYaw,
+                deltaPitch,
+                accelYaw,
+                accelPitch,
+                0.0f, // jerkYaw - будет обновлён позже
+                0.0f, // jerkPitch - будет обновлён позже
+                gcdErrorYaw,
+                gcdErrorPitch,
+                System.currentTimeMillis(),
+                player.getTransactionPing(),
+                player.isSprinting,
+                player.isSneaking
         );
 
         // Обновляем для следующей итерации
@@ -203,65 +234,76 @@ public class ImprovedAimML extends Check implements RotationCheck {
     /**
      * Анализ последовательности тиков через ML-модель
      */
+    // В методе analyzeSequence() УДАЛИ строки 268 и 276, оставь ОДНУ в конце:
+
     private void analyzeSequence() {
         if (trainedModel == null || tickHistory.size() < SEQUENCE_LENGTH) {
             return;
         }
 
-        // Извлекаем фичи
-        double[] features = extractFeatures(new ArrayList<>(tickHistory));
+        double totalMovement = 0.0;
+        for (TickData tick : tickHistory) {
+            totalMovement += Math.sqrt(tick.deltaYaw * tick.deltaYaw + tick.deltaPitch * tick.deltaPitch);
+        }
+        double avgMovement = totalMovement / tickHistory.size();
 
-        // Получаем предсказание
+        if (totalAnalyses % 20 == 0) {
+            System.out.println("[GrimAC ML DEBUG] " + player.getName() + " avgMove=" + String.format("%.2f", avgMovement) + " histSize=" + tickHistory.size());
+        }
+
+        if (avgMovement < 0.3) {
+            return;
+        }
+
+        List<TickData> tickList = new ArrayList<>(tickHistory);
+        double[] features = extractFeatures(tickList);
+
+        // ДОБАВИТЬ ДЕБАГ
+        System.out.println("[GrimAC ML DEBUG] Features extracted, length=" + features.length);
+        System.out.println("[GrimAC ML DEBUG] First 5 features: " + Arrays.toString(Arrays.copyOf(features, 5)));
+
         double probability = trainedModel.predict(features);
+
+        // ДОБАВИТЬ ДЕБАГ
+        System.out.println("[GrimAC ML DEBUG] Model returned probability=" + String.format("%.6f", probability));
+
         currentCheatProbability = probability;
 
-        // Обновляем VL
-        updateViolationLevel(probability);
+        // ОСТАВЛЯЕМ ТОЛЬКО ОДИН ВЫЗОВ addStrike (УБЕРИ строки 268 и 276!)
+        System.out.println("[GrimAC ML] Calling addStrike for " + player.getName() + " prob=" + String.format("%.4f", probability));
+        MLBridgeHolder.getBridge().addStrike(player.uuid, probability);
 
-        // Логируем подозрительную активность
-        if (probability > 0.5) {
-            System.out.println(String.format(
-                "[GrimAC ML] %s prob=%.2f VL=%.2f ticks=%d",
-                player.getName(),
-                probability,
-                violationLevel,
-                tickHistory.size()
-            ));
+        totalAnalyses++;
+        if (probability >= CHEAT_THRESHOLD) {
+            highProbabilityDetections++;
         }
 
-        // Алерт при высокой вероятности
-        if (probability > ALERT_THRESHOLD) {
-            String alertMsg = String.format(
-                "§c[GrimAC ML] §f%s §7suspicious (prob: §c%.1f%% §7VL: §e%.1f§7)",
-                player.getName(),
-                probability * 100,
-                violationLevel
-            );
-            alertWithPermission(alertMsg);
-        }
+        if (probability >= ALERT_THRESHOLD) {
+            long now = System.currentTimeMillis();
+            long timeSinceLastUpdate = now - lastVLUpdate;
 
-        // Флаг при достижении порога VL
-        if (violationLevel >= FLAG_VL) {
-            flagAndAlert(String.format(
-                "AimML (prob: %.1f%%, VL: %.1f)",
-                probability * 100,
-                violationLevel
-            ));
-            violationLevel = FLAG_VL * 0.8; // Снижаем чтобы не спамить
-        }
+            if (timeSinceLastUpdate >= 2000) {
+                double vlIncrease = (probability - ALERT_THRESHOLD) * 1.5;
+                violationLevel += vlIncrease;
+                lastVLUpdate = now;
 
-        // Кик при критическом VL
-        if (violationLevel >= KICK_VL) {
-            player.disconnect(Component.text(String.format(
-                "§c[GrimAC ML] AimBot detected!\n" +
-                "§7Probability: §c%.1f%%\n" +
-                "§7VL: §c%.1f",
-                probability * 100,
-                violationLevel
-            )));
+                if (violationLevel >= FLAG_VL) {
+                    String verbose = String.format(
+                            "ML=%.0f%% VL=%.1f avg=%.1f°",
+                            probability * 100,
+                            violationLevel,
+                            avgMovement
+                    );
+
+                    this.flagAndAlert(verbose);
+                }
+            }
+        } else {
+            if (probability < CHEAT_THRESHOLD * 0.7) {
+                violationLevel = Math.max(0, violationLevel - 0.3);
+            }
         }
     }
-
     /**
      * Обновление Violation Level
      */
@@ -289,8 +331,11 @@ public class ImprovedAimML extends Check implements RotationCheck {
     /**
      * Извлечение признаков из последовательности тиков
      */
+    /**
+     * Извлечение признаков из последовательности тиков (24 фичи)
+     */
     private double[] extractFeatures(List<TickData> ticks) {
-        double[] features = new double[24]; // Увеличиваем количество фичей
+        double[] features = new double[24]; // 24 фичи
 
         if (ticks.isEmpty()) return features;
 
@@ -319,8 +364,8 @@ public class ImprovedAimML extends Check implements RotationCheck {
         features[3] = standardDeviation(deltaPitches);
 
         // Feature 4-5: Максимальная скорость
-        features[4] = Collections.max(deltaYaws);
-        features[5] = Collections.max(deltaPitches);
+        features[4] = deltaYaws.isEmpty() ? 0 : Collections.max(deltaYaws);
+        features[5] = deltaPitches.isEmpty() ? 0 : Collections.max(deltaPitches);
 
         // Feature 6-7: Среднее ускорение
         features[6] = average(accelYaws);
@@ -363,10 +408,25 @@ public class ImprovedAimML extends Check implements RotationCheck {
         features[21] = features[10] / (features[0] + 0.001);
 
         // Feature 22: Максимальное ускорение
-        features[22] = Collections.max(accelYaws);
+        features[22] = accelYaws.isEmpty() ? 0 : Collections.max(accelYaws);
 
         // Feature 23: Процент идеально прямых углов
         features[23] = countPerfectAngles(ticks) / (double) ticks.size();
+
+
+
+        System.out.println("[FEATURES DEBUG] Extracted features:");
+        for (int i = 0; i < features.length; i++) {
+            System.out.println("  feature[" + i + "] = " + String.format("%.6f", features[i]));
+        }
+
+        // Проверка на NaN/Infinity
+        for (int i = 0; i < features.length; i++) {
+            if (Double.isNaN(features[i]) || Double.isInfinite(features[i])) {
+                System.out.println("[FEATURES ERROR] Feature " + i + " is NaN or Infinite!");
+                features[i] = 0.0;
+            }
+        }
 
         return features;
     }
@@ -386,7 +446,7 @@ public class ImprovedAimML extends Check implements RotationCheck {
 
     private double calculateEntropy(List<Double> values) {
         Map<Integer, Long> histogram = values.stream()
-            .collect(Collectors.groupingBy(v -> (int)(v / 5), Collectors.counting()));
+                .collect(Collectors.groupingBy(v -> (int)(v / 5), Collectors.counting()));
         double total = values.size();
         double entropy = 0;
         for (long count : histogram.values()) {
@@ -419,7 +479,7 @@ public class ImprovedAimML extends Check implements RotationCheck {
         int constantCount = 0;
         for (int i = 0; i < deltas.size() - 4; i++) {
             double avg = (deltas.get(i) + deltas.get(i+1) + deltas.get(i+2) +
-                         deltas.get(i+3) + deltas.get(i+4)) / 5.0;
+                    deltas.get(i+3) + deltas.get(i+4)) / 5.0;
             boolean allSimilar = true;
             for (int j = i; j < i + 5; j++) {
                 if (Math.abs(deltas.get(j) - avg) > 0.5) {
@@ -455,7 +515,7 @@ public class ImprovedAimML extends Check implements RotationCheck {
             double y = Math.abs(tick.deltaYaw);
             double p = Math.abs(tick.deltaPitch);
             if (Math.abs(y % 90) < 0.1 || Math.abs(p % 90) < 0.1 ||
-                Math.abs(y) < 0.1 || Math.abs(p) < 0.1) {
+                    Math.abs(y) < 0.1 || Math.abs(p) < 0.1) {
                 count++;
             }
         }
@@ -488,8 +548,8 @@ public class ImprovedAimML extends Check implements RotationCheck {
         public final boolean sprinting, sneaking;
 
         public TickData(float deltaYaw, float deltaPitch, float accelYaw, float accelPitch,
-                       float jerkYaw, float jerkPitch, float gcdErrorYaw, float gcdErrorPitch,
-                       long timestamp, int ping, boolean sprinting, boolean sneaking) {
+                        float jerkYaw, float jerkPitch, float gcdErrorYaw, float gcdErrorPitch,
+                        long timestamp, int ping, boolean sprinting, boolean sneaking) {
             this.deltaYaw = deltaYaw;
             this.deltaPitch = deltaPitch;
             this.accelYaw = accelYaw;
@@ -506,18 +566,18 @@ public class ImprovedAimML extends Check implements RotationCheck {
 
         public String toCsv(String label) {
             return String.format(Locale.US,
-                "%s,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
-                label.equals("CHEAT") ? "1" : "0",
-                deltaYaw, deltaPitch,
-                accelYaw, accelPitch,
-                jerkYaw, jerkPitch,
-                gcdErrorYaw, gcdErrorPitch
+                    "%s,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f",
+                    label.equals("CHEAT") ? "1" : "0",
+                    deltaYaw, deltaPitch,
+                    accelYaw, accelPitch,
+                    jerkYaw, jerkPitch,
+                    gcdErrorYaw, gcdErrorPitch
             );
         }
 
         public static String getCsvHeader() {
             return "is_cheating,delta_yaw,delta_pitch,accel_yaw,accel_pitch," +
-                   "jerk_yaw,jerk_pitch,gcd_error_yaw,gcd_error_pitch";
+                    "jerk_yaw,jerk_pitch,gcd_error_yaw,gcd_error_pitch";
         }
     }
 
@@ -585,7 +645,7 @@ public class ImprovedAimML extends Check implements RotationCheck {
             }
 
             System.out.println("[GrimAC ML] Saved dataset: " + file.getName() +
-                             " (" + ticks.size() + " ticks)");
+                    " (" + ticks.size() + " ticks)");
         }
     }
 
@@ -595,13 +655,23 @@ public class ImprovedAimML extends Check implements RotationCheck {
      * Начать локальную запись для игрока
      */
     public static void startRecording(GrimPlayer player, String collectionId) {
+        // Проверяем что не записываем уже
+        if (activeCollectors.containsKey(player.uuid)) {
+            System.out.println("[GrimAC ML] Игрок " + player.getName() + " уже записывает!");
+            return;
+        }
+
         DataCollector collector = new DataCollector(player.uuid, player.getName(), collectionId);
         collector.isRecording = true;
         activeCollectors.put(player.uuid, collector);
 
-        player.sendMessage("§a[GrimAC ML] Запись датасета начата!");
-    }
+        System.out.println("[GrimAC ML] ✓ Запись начата: " + player.getName() + " (ID: " + collectionId + ")");
 
+        // Отправляем сообщение игроку (только если не глобальный сбор)
+        if (!collectionId.startsWith("GLOBAL_")) {
+            player.sendMessage("§a[GrimAC ML] Запись датасета начата!");
+        }
+    }
     /**
      * Остановить запись и сохранить
      */
@@ -625,9 +695,9 @@ public class ImprovedAimML extends Check implements RotationCheck {
                 activeCollectors.remove(player.uuid);
                 String label = collector.isCheater ? "§c§lЧИТ" : "§a§lЛЕГИТ";
                 return String.format(
-                    "Датасет сохранён! Собрано %d тиков, метка: %s",
-                    tickCount,
-                    label
+                        "Датасет сохранён! Собрано %d тиков, метка: %s",
+                        tickCount,
+                        label
                 );
             } catch (IOException e) {
                 activeCollectors.remove(player.uuid);
@@ -646,12 +716,33 @@ public class ImprovedAimML extends Check implements RotationCheck {
         globalCollectionId = collectionId;
 
         int started = 0;
-        for (GrimPlayer player : ac.grim.grimac.GrimAPI.INSTANCE.getPlayerDataManager().getEntries()) {
-            if (!player.hasPermission("grim.ml.exempt")) {
-                startRecording(player, collectionId);
-                started++;
+
+        // Получаем всех онлайн игроков
+        Collection<GrimPlayer> allPlayers = GrimAPI.INSTANCE.getPlayerDataManager().getEntries();
+
+        System.out.println("[GrimAC ML] Глобальный сбор: найдено игроков: " + allPlayers.size());
+
+        for (GrimPlayer player : allPlayers) {
+            // Пропускаем игроков с пермишеном на освобождение
+            if (player.hasPermission("grim.ml.exempt")) {
+                System.out.println("[GrimAC ML] Игрок " + player.getName() + " пропущен (grim.ml.exempt)");
+                continue;
             }
+
+            // Проверяем что игрок ещё не записывает
+            if (activeCollectors.containsKey(player.uuid)) {
+                System.out.println("[GrimAC ML] Игрок " + player.getName() + " уже записывает");
+                continue;
+            }
+
+            // Начинаем запись
+            startRecording(player, collectionId);
+            started++;
+
+            System.out.println("[GrimAC ML] Начата запись для: " + player.getName());
         }
+
+        System.out.println("[GrimAC ML] Глобальный сбор запущен для " + started + " игроков");
 
         return started;
     }
@@ -668,33 +759,50 @@ public class ImprovedAimML extends Check implements RotationCheck {
         globalCollectionId = null;
 
         List<DataCollector> collectorsToArchive = new ArrayList<>();
-        for (DataCollector collector : activeCollectors.values()) {
+
+        System.out.println("[GrimAC ML] Останавливаем глобальный сбор: " + currentId);
+        System.out.println("[GrimAC ML] Активных коллекторов: " + activeCollectors.size());
+
+        for (Map.Entry<UUID, DataCollector> entry : activeCollectors.entrySet()) {
+            DataCollector collector = entry.getValue();
+
+            System.out.println("[GrimAC ML] Проверяем коллектор: " + collector.playerName +
+                    " (ID: " + collector.collectionId + ", тиков: " + collector.ticks.size() + ")");
+
             if (currentId.equals(collector.collectionId)) {
                 collector.isRecording = false;
                 collectorsToArchive.add(collector);
+                System.out.println("[GrimAC ML] ✓ Добавлен в архив: " + collector.playerName);
             }
         }
 
         if (collectorsToArchive.isEmpty()) {
+            System.out.println("[GrimAC ML] Нет данных для архивирования!");
             return "§eНет данных для архивирования";
         }
 
         // Удаляем из активных
         for (DataCollector collector : collectorsToArchive) {
             activeCollectors.remove(collector.playerUUID);
+            System.out.println("[GrimAC ML] Удалён из активных: " + collector.playerName);
         }
 
         // Создаём архив асинхронно
+        int totalTicks = collectorsToArchive.stream().mapToInt(c -> c.ticks.size()).sum();
+        System.out.println("[GrimAC ML] Всего тиков для архивации: " + totalTicks);
+
         ac.grim.grimac.GrimAPI.INSTANCE.getScheduler().getAsyncScheduler().runNow(
-            ac.grim.grimac.GrimAPI.INSTANCE.getGrimPlugin(),
-            () -> archiveCollectors(collectorsToArchive, currentId)
+                ac.grim.grimac.GrimAPI.INSTANCE.getGrimPlugin(),
+                () -> archiveCollectors(collectorsToArchive, currentId)
         );
 
         return String.format(
-            "§aГлобальный сбор остановлен! Архивируется %d датасет(ов)...",
-            collectorsToArchive.size()
+                "§aГлобальный сбор остановлен! Архивируется %d датасет(ов) (%d тиков)...",
+                collectorsToArchive.size(),
+                totalTicks
         );
     }
+
 
     /**
      * Архивирование коллекторов в ZIP
@@ -752,10 +860,10 @@ public class ImprovedAimML extends Check implements RotationCheck {
         sb.append("§7════════════════════════════════════\n");
 
         sb.append(String.format("§7Модель: %s\n",
-            trainedModel != null ? "§a✓ Загружена" : "§c✗ Не обучена"));
+                trainedModel != null ? "§a✓ Загружена" : "§c✗ Не обучена"));
         sb.append(String.format("§7Активных записей: §e%d\n", activeCollectors.size()));
         sb.append(String.format("§7Глобальный сбор: %s\n",
-            globalCollectionId != null ? "§a✓ " + globalCollectionId : "§c✗ Не активен"));
+                globalCollectionId != null ? "§a✓ " + globalCollectionId : "§c✗ Не активен"));
 
         DataCollector collector = activeCollectors.get(player.uuid);
         if (collector != null) {
@@ -768,8 +876,8 @@ public class ImprovedAimML extends Check implements RotationCheck {
             sb.append(String.format("  §7Время записи: §e%d сек\n", recordingTime));
 
             String quality = ticks < 100 ? "§cПЛОХОЕ" :
-                           ticks < 300 ? "§eСРЕДНЕЕ" :
-                           ticks < 500 ? "§aХОРОШЕЕ" : "§a§lОТЛИЧНОЕ";
+                    ticks < 300 ? "§eСРЕДНЕЕ" :
+                            ticks < 500 ? "§aХОРОШЕЕ" : "§a§lОТЛИЧНОЕ";
             sb.append(String.format("  §7Качество: %s\n", quality));
 
             String label = collector.isCheater ? "§c§lЧИТ" : "§7НЕ УСТАНОВЛЕНА";
@@ -798,12 +906,131 @@ public class ImprovedAimML extends Check implements RotationCheck {
                 return "§c[GrimAC ML] CSV файлы не найдены!";
             }
 
-            // TODO: Реализовать обучение модели на CSV
-            // Здесь нужно парсить CSV и обучать модель
+            System.out.println("[GrimAC ML] ═══════════════════════════════════");
+            System.out.println("[GrimAC ML] НАЧАЛО ОБУЧЕНИЯ МОДЕЛИ");
+            System.out.println("[GrimAC ML] ═══════════════════════════════════");
+            System.out.println("[GrimAC ML] Найдено файлов: " + csvFiles.length);
+
+            // Загружаем все данные
+            List<AimModel_SMART.TrainingExample> allData = new ArrayList<>();
+            int legitCount = 0;
+            int cheatCount = 0;
+
+            for (File csvFile : csvFiles) {
+                System.out.println("[GrimAC ML] Загрузка: " + csvFile.getName());
+
+                try (BufferedReader br = new BufferedReader(new FileReader(csvFile))) {
+                    String header = br.readLine(); // Пропускаем заголовок
+
+                    String line;
+                    int lineCount = 0;
+                    while ((line = br.readLine()) != null) {
+                        if (line.trim().isEmpty()) continue;
+
+                        String[] parts = line.split(",");
+                        if (parts.length < 9) continue; // Минимум 9 колонок
+
+                        try {
+                            // Парсим данные
+                            double label = Double.parseDouble(parts[0]); // 0 или 1
+                            double[] features = new double[parts.length - 1];
+
+                            for (int i = 1; i < parts.length; i++) {
+                                features[i - 1] = Double.parseDouble(parts[i]);
+                            }
+
+                            allData.add(new AimModel_SMART.TrainingExample(features, label));
+
+                            if (label > 0.5) {
+                                cheatCount++;
+                            } else {
+                                legitCount++;
+                            }
+
+                            lineCount++;
+                        } catch (NumberFormatException e) {
+                            // Пропускаем плохие строки
+                        }
+                    }
+
+                    System.out.println("[GrimAC ML]   → Загружено строк: " + lineCount);
+
+                } catch (IOException e) {
+                    System.err.println("[GrimAC ML] Ошибка чтения файла: " + csvFile.getName());
+                    e.printStackTrace();
+                }
+            }
+
+            if (allData.isEmpty()) {
+                return "§c[GrimAC ML] Не удалось загрузить данные из CSV!";
+            }
+
+            if (allData.size() < MIN_SAMPLES_FOR_TRAINING) {
+                return String.format(
+                        "§c[GrimAC ML] Недостаточно данных! Есть: %d, нужно: %d",
+                        allData.size(), MIN_SAMPLES_FOR_TRAINING
+                );
+            }
+
+            System.out.println("[GrimAC ML] ═══════════════════════════════════");
+            System.out.println("[GrimAC ML] Всего примеров: " + allData.size());
+            System.out.println("[GrimAC ML] Легитных: " + legitCount);
+            System.out.println("[GrimAC ML] Читеров: " + cheatCount);
+            System.out.println("[GrimAC ML] ═══════════════════════════════════");
+
+            // Балансировка классов (если нужно)
+            if (Math.abs(legitCount - cheatCount) > allData.size() * 0.3) {
+                System.out.println("[GrimAC ML] ⚠ Дисбаланс классов обнаружен!");
+                allData = balanceDataset(allData);
+                System.out.println("[GrimAC ML] ✓ Данные сбалансированы: " + allData.size() + " примеров");
+            }
+
+            // Перемешиваем данные
+            Collections.shuffle(allData, new Random(42));
+
+            // Разделяем на train/validation (80/20)
+            int trainSize = (int) (allData.size() * 0.8);
+            List<AimModel_SMART.TrainingExample> trainData = allData.subList(0, trainSize);
+            List<AimModel_SMART.TrainingExample> validData = allData.subList(trainSize, allData.size());
+
+            System.out.println("[GrimAC ML] Обучающая выборка: " + trainData.size());
+            System.out.println("[GrimAC ML] Валидационная выборка: " + validData.size());
+
+            // Создаём и обучаем модель
+            int numFeatures = allData.get(0).features.length;
+            AimModel_SMART model = new AimModel_SMART(numFeatures);
+
+            double learningRate = 0.05;      // было 0.01 → стало 0.05
+            double l2Lambda = 0.0001;        // было 0.001 → стало 0.0001
+            int maxIterations = 1000;        // было 500 → стало 1000
+
+            model.train(trainData, validData, learningRate, l2Lambda, maxIterations);
+
+            // Сохраняем модель
+            File modelDir = new File(MODEL_FILE).getParentFile();
+            if (modelDir != null) {
+                modelDir.mkdirs();
+            }
+            model.save(MODEL_FILE);
+
+            // Обновляем глобальную модель
+            trainedModel = model;
+
+            System.out.println("[GrimAC ML] ═══════════════════════════════════");
+            System.out.println("[GrimAC ML] ОБУЧЕНИЕ ЗАВЕРШЕНО УСПЕШНО!");
+            System.out.println("[GrimAC ML] " + model.getMetrics());
+            System.out.println("[GrimAC ML] ═══════════════════════════════════");
 
             return String.format(
-                "§a[GrimAC ML] Обучение завершено! Использовано %d файлов.",
-                csvFiles.length
+                    "§a[GrimAC ML] Модель обучена успешно!\n" +
+                            "§7Использовано файлов: §e%d\n" +
+                            "§7Примеров: §e%d §7(Легит: §a%d§7, Читы: §c%d§7)\n" +
+                            "§7%s",
+                    csvFiles.length,
+                    allData.size(),
+                    legitCount,
+                    cheatCount,
+                    model.getMetrics()
             );
 
         } catch (Exception e) {
@@ -812,6 +1039,36 @@ public class ImprovedAimML extends Check implements RotationCheck {
         }
     }
 
+    private static List<AimModel_SMART.TrainingExample> balanceDataset(
+            List<AimModel_SMART.TrainingExample> data) {
+
+        List<AimModel_SMART.TrainingExample> legitExamples = new ArrayList<>();
+        List<AimModel_SMART.TrainingExample> cheatExamples = new ArrayList<>();
+
+        // Разделяем на классы
+        for (AimModel_SMART.TrainingExample ex : data) {
+            if (ex.label > 0.5) {
+                cheatExamples.add(ex);
+            } else {
+                legitExamples.add(ex);
+            }
+        }
+
+        // Находим минимальный размер
+        int minSize = Math.min(legitExamples.size(), cheatExamples.size());
+
+        // Берём равное количество из каждого класса
+        List<AimModel_SMART.TrainingExample> balanced = new ArrayList<>();
+        Collections.shuffle(legitExamples);
+        Collections.shuffle(cheatExamples);
+
+        balanced.addAll(legitExamples.subList(0, minSize));
+        balanced.addAll(cheatExamples.subList(0, minSize));
+
+        return balanced;
+    }
+
+
     /**
      * Загрузить модель
      */
@@ -819,13 +1076,17 @@ public class ImprovedAimML extends Check implements RotationCheck {
         try {
             File modelFile = new File(MODEL_FILE);
             if (modelFile.exists()) {
-                trainedModel = AimModel.load(MODEL_FILE);
+                trainedModel = AimModel_SMART.load(MODEL_FILE);
+                System.out.println("[GrimAC ML] ═══════════════════════════════════");
                 System.out.println("[GrimAC ML] Модель загружена: " + MODEL_FILE);
+                System.out.println("[GrimAC ML] " + trainedModel.getMetrics());
+                System.out.println("[GrimAC ML] ═══════════════════════════════════");
             } else {
                 System.out.println("[GrimAC ML] Модель не найдена, работаем в режиме сбора данных");
             }
         } catch (Exception e) {
             System.err.println("[GrimAC ML] Ошибка загрузки модели: " + e.getMessage());
+            e.printStackTrace();
         }
     }
 
@@ -850,9 +1111,9 @@ public class ImprovedAimML extends Check implements RotationCheck {
         if (files == null) return Collections.emptyList();
 
         return Arrays.stream(files)
-            .map(File::getName)
-            .sorted()
-            .collect(Collectors.toList());
+                .map(File::getName)
+                .sorted()
+                .collect(Collectors.toList());
     }
 
     // ========== ML МОДЕЛЬ (заглушка) ==========
